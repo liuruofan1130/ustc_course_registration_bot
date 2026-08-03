@@ -1,0 +1,16 @@
+# 虚拟环境
+.venv/
+
+# Playwright 登录态（含 cookie，敏感，勿提交）
+auth.json
+.browser_data/
+
+# 运行日志
+run.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地覆盖配置
+config.local.json

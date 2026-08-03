@@ -1,0 +1,9 @@
+{
+  "student_id": "",
+  "turn_id": "",
+  "target_lesson_id": "",
+  "target_course_name": "",
+  "interval_seconds": 30,
+  "mode": "spam",
+  "notify_webhook_url": ""
+}
