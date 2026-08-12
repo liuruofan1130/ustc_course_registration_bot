@@ -1,44 +1,40 @@
 #!/usr/bin/env python3
 # encoding=utf8
-"""USTC 教务系统：盲抢选课（Windows / Linux 通用）。
+"""USTC 教务系统：监控式抢课（Windows / Linux 通用）。
 
 接口契约（全部为 application/x-www-form-urlencoded，来自真实抓包）：
   GET  /for-std/course-select                     -> 302 到 .../{sid}/turn/{tid}/select
-  POST /ws/for-std/course-select/addable-lessons   body: turnId, studentId
+  POST /ws/for-std/course-select/addable-lessons   body: turnId, studentId            （--list 列课用）
+  POST /ws/for-std/course-select/std-count         body: lessonIds[]=...              （取已选人数）
   POST /ws/for-std/course-select/add-request       body: studentAssoc, lessonAssoc,
                                                       courseSelectTurnAssoc, scheduleGroupAssoc, virtualCost
                                                   -> 返回 requestId
-  POST /ws/for-std/course-select/add-drop-response body: studentId, requestId   -> 确认选课
+  POST /ws/for-std/course-select/add-drop-response body: studentId, requestId         -> 确认选课
 
-真实响应：{success, errorMessage:{textZh,textEn,text}, requestId, ...}
-  满员时 success=false, errorMessage.textZh="教学班人数已满"。
+核心思路（监控式，模仿"刷新看人数"）：
+  每轮先 POST std-count 查「已选人数」，只有 stdCount < limitCount（有空位）时，
+  才 POST add-request / add-drop-response 真正选课。把高频"写操作"降成高频"读操作"，
+  显著降低被风控判定为刷选课的概率。
+  叠加：随机间隔（打掉固定节拍）、活跃时段（凌晨不跑）、失败熔断（连续异常自动停）。
 
 模式：
-  spam    : 盲抢——不检查容量，每隔 N 秒直接尝试选课，成功即退出。推荐。
-  monitor : 仅提醒（依赖 stdCount，当前系统取不到，效果有限）
-  grab    : 监控到空位才抢（同上）
+  spam    : 监控到空位→自动选课，成功即退出（推荐）
+  monitor : 监控到空位→仅提醒，不选课
+  grab    : 同 spam（别名）
 
-跨平台：
-  - Windows / macOS：直接 `python grabbing.py`，默认非 headless（本机有浏览器）。
-  - Linux 服务器（无 $DISPLAY）：默认 headless，登录态来自 auth.json（见下）。
-  headless 默认值由 _default_headless() 按平台自动判断；config.json 显式设了则以配置为准，
-  命令行 --headless / --login 优先级最高。
-
-登录态（auth.json）：
-  - `python grabbing.py --login` 在「有浏览器的机器」上执行，登录后生成 ./auth.json
-    （Playwright storage_state，纯 JSON 含 cookie，跨平台可靠）。
-  - Linux 服务器无图形界面，无法在此登录：在本机 --login 生成 auth.json，拷到服务器即可。
-  - 脚本持续运行时服务器会续期 cookie；长期挂着一般不会过期。
+跨平台：Windows/macOS 默认非 headless；Linux 无 $DISPLAY 默认 headless。
+登录态：本机 `--login` 生成 auth.json，拷到无界面机器即可。
 
 用法：
-  python grabbing.py --login            # 本机：登录并生成 auth.json（需图形界面）
-  python grabbing.py --list             # 列出可选课（用于查 lessonId）
-  python grabbing.py                    # 按 config.json 盲抢
-  python grabbing.py --lesson 123456 -m spam -t 30 --log run.log
+  python grabbing.py --login            # 本机：登录并生成 auth.json
+  python grabbing.py --list             # 列出可选课（用于查 lessonId / 容量）
+  python grabbing.py                    # 按 config.json 监控抢课
+  python grabbing.py --lesson 123456 -t 60 --log run.log
 """
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -50,7 +46,6 @@ BASE = "https://jw.ustc.edu.cn"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 
-# add-request 正常返回的 requestId 形如 UUID v1
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
 
@@ -89,14 +84,18 @@ class _Tee:
 # ----------------------------- 配置 -----------------------------
 def load_config():
     default = {
-        "student_id": "",          # 学生关联 id；留空自动解析，不确定时手填
-        "turn_id": "",             # 选课轮次 id，每学期变；从选课页 URL .../turn/{id}/select 取
-        "target_lesson_id": "",    # 目标课 lessonId（最精确，推荐）
-        "target_course_name": "",  # 或用课程名模糊匹配（兜底）
-        "interval_seconds": 30,    # 尝试间隔（秒），建议 ≥ 30
-        "mode": "spam",            # spam 盲抢(推荐) | monitor 仅提醒 | grab 监控到空位才抢
-        "notify_webhook_url": "",  # 可选：事件时 GET 该 url（Server酱/Bark/QQbot）
-        # headless 不在此处硬编码：默认按平台自动判断；需固定时在 config.json 加 "headless": true/false
+        "student_id": "",          # 学生关联 id；留空自动解析
+        "turn_id": "",             # 选课轮次 id，每学期变
+        "target_lesson_id": "",    # 目标课 lessonId
+        "target_course_name": "",  # 课程名模糊匹配（兜底）
+        "limit_count": 0,          # 必填：目标课「满课人数」(容量上限)
+        "interval_seconds": 60,    # 查询基准间隔（秒），实际 = interval ± jitter
+        "jitter_seconds": 15,      # 随机抖动（秒）；60±15 = 45~75
+        "active_hours": "6:30-1:00",  # 活跃时段 HH:MM-HH:MM；1:00-6:30 暂停；空=全天
+        "max_errors": 20,          # 连续异常熔断阈值
+        "mode": "spam",            # spam 监控到空位就抢(推荐) | monitor 仅提醒 | grab 同 spam
+        "notify_webhook_url": "",  # 可选：事件时 GET 该 url
+        # headless 不在此硬编码：默认按平台自动判断
     }
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -151,25 +150,29 @@ def list_all_lessons(context, sid, tid, max_pages=30, size=100):
                 seen[lid] = it
                 order.append(it)
                 new += 1
-        if new == 0:            # 每页重复 → 分页参数无效，停止
+        if new == 0:
             break
-        if len(items) < size:   # 最后一页
+        if len(items) < size:
             break
     return order
 
 
+def std_count_raw(context, lesson_id, sid, tid):
+    """POST std-count 查已选人数，返回原始 response。body: lessonIds[]={lessonId}"""
+    return post(context, "/ws/for-std/course-select/std-count",
+                [("lessonIds[]", str(lesson_id))], _referer(sid, tid))
+
+
 def add_request(context, sid, tid, lesson_id):
-    r = post(context, "/ws/for-std/course-select/add-request",
-             [("studentAssoc", sid), ("lessonAssoc", str(lesson_id)),
-              ("courseSelectTurnAssoc", tid), ("scheduleGroupAssoc", ""),
-              ("virtualCost", "0")], _referer(sid, tid))
-    return r
+    return post(context, "/ws/for-std/course-select/add-request",
+                [("studentAssoc", sid), ("lessonAssoc", str(lesson_id)),
+                 ("courseSelectTurnAssoc", tid), ("scheduleGroupAssoc", ""),
+                 ("virtualCost", "0")], _referer(sid, tid))
 
 
 def add_drop_response(context, sid, tid, request_id):
-    r = post(context, "/ws/for-std/course-select/add-drop-response",
-             [("studentId", sid), ("requestId", request_id)], _referer(sid, tid))
-    return r
+    return post(context, "/ws/for-std/course-select/add-drop-response",
+                [("studentId", sid), ("requestId", request_id)], _referer(sid, tid))
 
 
 # ----------------------------- 解析 -----------------------------
@@ -208,10 +211,6 @@ def _limit(it):
     return it.get("limitCount") or it.get("capacity") or 0
 
 
-def _std(it):
-    return it.get("stdCount") or it.get("selectedCount") or 0
-
-
 def _lesson_id(it):
     return str(it.get("id") or it.get("lessonId") or "")
 
@@ -224,6 +223,48 @@ def find_target(data, lesson_id=None, course_name=""):
         if course_name and course_name in _name(it):
             return it, items
     return None, items
+
+
+def _parse_std_count(data, lesson_id):
+    """从 std-count 响应里解析已选人数（int），结构以实际为准，多兜底。返回 None 表示没解析出来。"""
+    lid = str(lesson_id)
+
+    def coerce(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v.strip())
+        if isinstance(v, dict):
+            for k in ("stdCount", "count", "selectedCount", "stdCnt"):
+                if k in v:
+                    return coerce(v[k])
+        return None
+
+    def find(obj):
+        if isinstance(obj, dict):
+            if lid in obj:
+                r = coerce(obj[lid])
+                if r is not None:
+                    return r
+            for key in ("data", "rows", "result", "lessons"):
+                if key in obj:
+                    r = find(obj[key])
+                    if r is not None:
+                        return r
+            for v in obj.values():
+                r = find(v)
+                if r is not None:
+                    return r
+        elif isinstance(obj, list):
+            for v in obj:
+                r = find(v)
+                if r is not None:
+                    return r
+        return None
+
+    return find(data)
 
 
 def parse_add_result(r2):
@@ -250,35 +291,87 @@ def parse_add_result(r2):
 
 
 def _looks_like_login_page(body, status):
-    """判断响应是否其实是登录页/未授权（登录态过期的典型表现）。"""
     low = body.lower()
     return (status in (401, 403) or "<html" in low or "/login" in low
             or "passport.ustc" in low or "id.ustc" in low or "cas/login" in low)
 
 
+def _safe_json(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 # ----------------------------- 选课 -----------------------------
 def grab(context, sid, tid, lesson_id):
-    """执行一次选课：add-request 拿 requestId，再 add-drop-response 确认。
-
-    若检测到登录态过期（响应不是 UUID 而是 HTML/401），抛 LoginExpired。
-    """
+    """执行一次选课：add-request 拿 requestId，再 add-drop-response 确认。"""
     r1 = add_request(context, sid, tid, lesson_id)
     body1 = r1.text()
-    status1 = r1.status
     rid = body1.strip().strip('"')
-
     if not _UUID_RE.match(rid):
-        if _looks_like_login_page(body1, status1):
-            raise LoginExpired(
-                f"登录态已过期（add-request status={status1}, 片段={body1[:80]!r}）")
-        if not rid:
-            return False, f"add-request 未返回 requestId(status={status1}): {body1[:160]}"
-
+        if _looks_like_login_page(body1, r1.status):
+            raise LoginExpired(f"登录态已过期（add-request status={r1.status}）")
+        return False, f"add-request 未返回 requestId(status={r1.status}): {body1[:160]}"
     r2 = add_drop_response(context, sid, tid, rid)
     body2 = r2.text()
     if _looks_like_login_page(body2, r2.status):
         raise LoginExpired(f"登录态已过期（add-drop-response status={r2.status}）")
     return parse_add_result(r2)
+
+
+# ----------------------------- 时段 / 间隔 -----------------------------
+def _parse_hhmm(s):
+    """'6:30' -> 390 (当天 0:00 起的分钟数)。失败返回 None。"""
+    try:
+        h, m = s.strip().split(":", 1)
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+def _now_minutes():
+    t = time.localtime()
+    return t.tm_hour * 60 + t.tm_min
+
+
+def _in_active_hours(spec):
+    """spec 如 '6:30-1:00' → 当前时刻是否在活跃段内。
+
+    支持跨天：start>=end 时视为 [start,24:00)∪[00:00,end)。
+    例如 6:30-1:00 = 6:30~次日1:00 活跃，1:00~6:30 暂停。
+    空则全天放行。
+    """
+    if not spec or not spec.strip():
+        return True
+    try:
+        a, b = spec.split("-", 1)
+        start = _parse_hhmm(a)
+        end = _parse_hhmm(b)
+        if start is None or end is None:
+            return True
+    except Exception:
+        return True
+    now = _now_minutes()
+    if start < end:
+        return start <= now < end
+    else:  # 跨天
+        return now >= start or now < end
+
+
+def _minutes_to_active(spec):
+    """到下一个活跃起点的大致分钟数（用于暂停期间休眠）。"""
+    try:
+        a, _ = spec.split("-", 1)
+        start = _parse_hhmm(a)
+        if start is None:
+            return 60
+    except Exception:
+        return 60
+    now = _now_minutes()
+    if now < start:
+        return max(1, start - now)
+    return max(1, 24 * 60 - now + start)
 
 
 # ----------------------------- 通知 -----------------------------
@@ -307,16 +400,16 @@ def print_lessons(items, limit=20):
 
 # ----------------------------- 主流程 -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="USTC 教务系统 盲抢选课（Windows / Linux 通用）")
-    ap.add_argument("--lesson", help="目标课 lessonId（如 123456），优先于配置文件")
+    ap = argparse.ArgumentParser(description="USTC 教务系统 监控式抢课（Windows / Linux 通用）")
+    ap.add_argument("--lesson", help="目标课 lessonId，优先于配置文件")
     ap.add_argument("--name", help="目标课课程名（模糊匹配）")
     ap.add_argument("-m", "--mode", choices=["spam", "monitor", "grab"],
-                    help="spam 盲抢(推荐) | monitor 仅提醒 | grab 监控到空位才抢")
-    ap.add_argument("-t", "--interval", type=int, help="尝试间隔（秒）")
+                    help="spam 监控到空位就抢(推荐) | monitor 仅提醒 | grab 同 spam")
+    ap.add_argument("-t", "--interval", type=int, help="查询基准间隔（秒）")
     ap.add_argument("--headless", action="store_true", help="强制无头模式")
     ap.add_argument("--login", action="store_true", help="仅登录建立登录态后退出（需图形界面）")
-    ap.add_argument("--list", action="store_true", help="列出可选课再退出（用于查 lessonId）")
-    ap.add_argument("--log", help="同时把输出写入该日志文件（相对路径基于本项目目录）")
+    ap.add_argument("--list", action="store_true", help="列出可选课再退出（查 lessonId / 容量）")
+    ap.add_argument("--log", help="同时把输出写入该日志文件")
     args = ap.parse_args()
 
     if args.log:
@@ -332,7 +425,7 @@ def main():
 
     headless = cfg.get("headless", _default_headless())
     if args.headless: headless = True
-    if args.login: headless = False   # 登录必须有可见浏览器
+    if args.login: headless = False
 
     storage_state = jw_login.AUTH_JSON if os.path.exists(jw_login.AUTH_JSON) else None
     pw, context = jw_login.open_context(headless=headless, storage_state=storage_state)
@@ -356,13 +449,11 @@ def main():
         if args.login:
             jw_login.save_auth(context)
             print("登录态已保存到 ./auth.json（cookie，跨平台）。")
-            print("下一步：在浏览器里点进选课页，地址栏 .../turn/<数字>/select 中的 <数字> 即")
-            print("        turn_id，填入 config.json；再填 student_id、target_lesson_id 即可抢课。")
-            print("部署到无图形界面的机器：把 auth.json 拷过去即可。")
+            print("下一步：点进选课页，地址栏 .../turn/<数字>/select 中的 <数字> 即 turn_id；")
+            print("        再把 student_id / turn_id / target_lesson_id 填入 config.json。")
             return
 
-        need_list = args.list or cfg["mode"] in ("monitor", "grab")
-        data = list_all_lessons(context, sid, tid) if need_list else []
+        data = list_all_lessons(context, sid, tid) if args.list else []
         target, items = find_target(data, cfg.get("target_lesson_id"), cfg.get("target_course_name"))
 
         if args.list:
@@ -370,84 +461,109 @@ def main():
             return
 
         mode = cfg["mode"]
-        lid = cfg.get("target_lesson_id") or (target and _lesson_id(target)) or ""
+        lid = cfg.get("target_lesson_id") or ""
         if not lid:
             print("\n未指定目标课。请在 config.json 设置 target_lesson_id。")
-            print("可选课片段（前 5 条）：")
-            print_lessons(items, limit=5)
             return
-        cname = _name(target) if target else f"lessonId={lid}"
+        cname = cfg.get("target_course_name") or (target and _name(target)) or f"lessonId={lid}"
 
-        if mode != "spam" and not target:
-            print(f"\n未在可选列表中找到 lessonId={lid}（monitor/grab 模式需要它在列表里）。")
-            print("可用 `--list` 核对，或改用 spam 盲抢模式（config.json 设 mode=spam）。")
+        # ---- 满课人数 / 容量上限（用户手动填）----
+        limit = int(cfg.get("limit_count") or 0)
+        if not limit:
+            print(f"\n请在 config.json 填入 limit_count：目标课的「满课人数」(容量上限)。")
+            print("脚本在「已选人数 < 满课人数」(有人退课空出位置) 时才发起选课。")
+            print("可用 `grabbing.py --list` 查看课程的 limitCount 字段作参考。")
             return
 
-        interval = max(5, int(cfg.get("interval_seconds", 30)))
+        # ---- 探测 std-count 响应结构（首次，便于排查）----
+        try:
+            probe = std_count_raw(context, lid, sid, tid)
+            probe_body = probe.text()
+            if _looks_like_login_page(probe_body, probe.status):
+                raise LoginExpired("登录态已过期（std-count 探测）")
+            probe_count = _parse_std_count(_safe_json(probe_body), lid)
+            print(f"std-count 探测：HTTP {probe.status}，解析人数={probe_count}，原始片段={probe_body[:120]!r}")
+        except LoginExpired as e:
+            print(f"⚠️ 探测发现登录态过期：{e}")
+            print("请在有图形界面的机器 `python grabbing.py --login` 重新生成 auth.json，拷回后重跑。")
+            notify(cfg, f"登录态过期，需重新登录：{cname}")
+            return
+        except Exception as e:
+            print(f"std-count 探测异常：{type(e).__name__}: {e}")
+
+        interval = max(10, int(cfg.get("interval_seconds", 60)))
+        jitter = max(0, int(cfg.get("jitter_seconds", interval // 3)))
+        active = (cfg.get("active_hours") or "").strip()
+        max_errors = max(3, int(cfg.get("max_errors", 20)))
+
+        print(f"\n监控抢课：目标 {cname}（lessonId={lid}）容量={limit}")
+        print(f"间隔 {interval}±{jitter}s | 活跃时段={active or '全天'} | 模式={mode} | 熔断={max_errors}")
+        print("逻辑：每轮先查人数，stdCount<容量 才提交选课。\n")
+
         n = 0
-
-        if mode == "spam":
-            print(f"盲抢模式：每 {interval}s 直接尝试选课 {cname}（lessonId={lid}），成功即退出。")
-            print("（不检查容量；一旦有人退课空出位置，下一轮即命中。）\n")
-            while True:
-                n += 1
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    ok, msg = grab(context, sid, tid, lid)
-                    print(f"[{ts}] #{n} 选课: ok={ok} | {msg}")
-                    if ok:
-                        notify(cfg, f"选课成功：{cname}（lessonId={lid}）")
-                        print("选课成功，退出。")
-                        return
-                except LoginExpired as e:
-                    print(f"[{ts}] #{n} ⚠️ {e}")
-                    print("    请在有图形界面的机器上运行 `python grabbing.py --login` 重新生成\n"
-                          "    auth.json，再把它拷到本项目下，然后重新运行。")
-                    notify(cfg, f"登录态过期，需重新登录：{cname}")
-                    return  # 退出，等待人工重登，避免空转
-                except Exception as e:
-                    print(f"[{ts}] #{n} 异常 {type(e).__name__}: {e}")
-                time.sleep(interval)
-
-        # ---------- monitor / grab ----------
-        print(f"目标课：{cname}  lessonId={lid}  容量={_limit(target) if target else '?'}  模式={mode}")
-        print("提示：addable-lessons 当前不返回已选人数，monitor/grab 判断可能不准，建议用 spam。\n")
+        consecutive_err = 0
         while True:
             n += 1
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            # 活跃时段：非活跃则睡到下一档
+            if not _in_active_hours(active):
+                mins = _minutes_to_active(active)
+                print(f"[{ts}] #{n} 非活跃时段({active})，休眠约 {mins} 分钟")
+                time.sleep(min(max(mins * 60, 60), 3600))
+                continue
             try:
-                data = list_lessons(context, sid, tid)
-                target, _ = find_target(data, lid, "")
-                if target is None:
-                    print(f"[{ts}] #{n} 该课不在可选列表（可能已选上/被移除）")
+                r = std_count_raw(context, lid, sid, tid)
+                body = r.text()
+                if _looks_like_login_page(body, r.status):
+                    raise LoginExpired(f"登录态已过期（std-count status={r.status}）")
+                count = _parse_std_count(_safe_json(body), lid)
+                if count is None:
+                    print(f"[{ts}] #{n} 人数解析失败，原始: {body[:160]!r}")
+                    consecutive_err += 1
+                elif count < limit:
+                    consecutive_err = 0
+                    print(f"[{ts}] #{n} 有空位！{count}/{limit}")
+                    notify(cfg, f"空位提醒：{cname} {count}/{limit}")
+                    if mode in ("spam", "grab"):
+                        ok, msg = grab(context, sid, tid, lid)
+                        print(f"  选课结果: ok={ok} | {msg}")
+                        if ok:
+                            notify(cfg, f"选课成功：{cname}（lessonId={lid}）")
+                            print("选课成功，退出。")
+                            return
                 else:
-                    std, lim = _std(target), _limit(target)
-                    if std < lim:
-                        print(f"[{ts}] #{n} 有空位！{std}/{lim}")
-                        notify(cfg, f"空位提醒：{cname} {std}/{lim}")
-                        if mode == "grab":
-                            ok, msg = grab(context, sid, tid, lid)
-                            print("  选课结果:", ok, "|", msg)
-                            if ok:
-                                notify(cfg, f"选课成功：{cname}")
-                                print("选课成功，退出。")
-                                return
-                    else:
-                        print(f"[{ts}] #{n} 已满 {std}/{lim}")
+                    consecutive_err = 0
+                    print(f"[{ts}] #{n} 已满 {count}/{limit}")
             except LoginExpired as e:
                 print(f"[{ts}] #{n} ⚠️ {e}")
-                print("    登录态过期，请重新 `--login` 生成 auth.json。")
+                print("    请在有图形界面的机器 `python grabbing.py --login` 重新生成 auth.json，")
+                print("    拷回本项目后重新运行。")
                 notify(cfg, f"登录态过期，需重新登录：{cname}")
                 return
             except Exception as e:
-                print(f"[{ts}] #{n} 轮询异常 {type(e).__name__}: {e}")
-            time.sleep(interval)
+                consecutive_err += 1
+                print(f"[{ts}] #{n} 异常 {type(e).__name__}: {e}")
+                if consecutive_err >= max_errors:
+                    print(f"连续 {consecutive_err} 次异常，触发熔断，停止。请检查网络/登录态。")
+                    notify(cfg, f"{cname} 监控熔断停止（连续异常）")
+                    return
+            sleep_s = interval + random.randint(-jitter, jitter)
+            time.sleep(max(5, sleep_s))
     finally:
+        # 三处资源清理彼此独立，任一失败不影响其余
         try:
             context.close()
         except Exception:
             pass
-        pw.stop()
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        try:
+            if args.log:
+                log_fp.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -1,41 +1,37 @@
-# ustc 盲抢选课（Windows / Linux 通用）
+# ustc 监控式抢课（Windows / Linux 通用）
 
-自动盲抢一门课：每隔 N 秒尝试选课，有人退课空位即命中并退出。适配 2026 新版教务系统（统一认证 `id.ustc.edu.cn`）。**同一份代码在 Windows 和 Linux 都能直接跑。**
+监控一门课的已选人数，发现空位（有人退课）时自动选课。适配 2026 新版教务系统。**同一份代码在 Windows 和 Linux 都能直接跑。**
 
+## ⚠️ 风险提示
+自动抢课可能触发教务系统风控，导致账号受限，**后果自负**。建议：间隔 ≥ 60 秒、避开凌晨、单账号、见好就收。
 
-## ⚠️ 请勿滥用
-仅用于正当补选。间隔建议 ≥ 30 秒。脚本开发者对滥用后果不负责任。
+## 核心逻辑（监控式，比盲抢温和）
 
+每轮先 POST `std-count` 查「已选人数」——这正是你在浏览器里刷新看人数的同一个接口：
+- **已满** → 什么都不做，等下一轮；
+- **有空位**（`stdCount < 容量`）→ 才 POST `add-request` → `add-drop-response` 真正选课。
 
-## 它能做什么
-
-- **盲抢（推荐，默认）**：指定 `lessonId`，每 N 秒自动尝试选课，成功即退出。
-- 列出本轮可选课（自动翻页），方便查 `lessonId`。
-- **跨平台 + 跨机器**：登录态存 `auth.json`（纯 JSON cookie），本机登录一次，拷到 Linux 服务器即可用。
-- **headless 自动判断**：Windows/macOS 默认有头；Linux 无 `$DISPLAY` 默认无头。无需手动配置。
+把高频「写操作（选课）」降成高频「读操作（查人数）」，显著降低被风控判定为「刷选课」的概率。
+叠加三道保护：**随机间隔**（打掉固定节拍）、**活跃时段**（凌晨不跑）、**失败熔断**（连续异常自动停）。
 
 ## 工作原理
 
-1. `python grabbing.py --login` 在**有浏览器的机器**上登录一次，生成 `auth.json`（Playwright `storage_state`，跨平台可靠）。
-2. 运行时用浏览器的请求通道（自动带 cookie）调用教务接口。
-3. **盲抢** = `add-request`（拿 `requestId`）→ `add-drop-response`（确认）。满员返回 `success=false, "教学班人数已满"`；空位返回 `success=true`，脚本退出。
+1. `python grabbing.py --login` 在有浏览器的机器登录一次，生成 `auth.json`（cookie）。
+2. 运行时用浏览器请求通道（自动带 cookie）调用教务接口。
+3. 监控循环：`std-count` 查人数 → 有空位时 `add-request`/`add-drop-response` 选课 → 成功退出。
 
-## 为什么是「盲抢」
-
-新系统 `addable-lessons` 只返回容量 `limitCount`，**不返回已选人数 `stdCount`**，无法判断是否满/是否退课。故直接反复尝试选课，靠系统返回的成功/失败判定。（`monitor`/`grab` 模式因取不到人数，基本无效。）
-
+> 注：`std-count` 接口只返回「已选人数」，不含「容量上限」；容量从 `addable-lessons` 取或手动填 `limit_count`。
 
 ## 快速开始
 
 ### 1. 装环境（一次性）
 
-**Windows**（PowerShell / cmd）：
+**Windows**：
 ```bat
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\playwright install chromium
 ```
-
 **Linux / macOS**：
 ```bash
 python3 -m venv .venv
@@ -44,92 +40,69 @@ python3 -m venv .venv
 ```
 
 ### 2. 登录（在有浏览器的机器上，生成 auth.json）
-
-```bash
-# Windows
-.venv\Scripts\python grabbing.py --login
-# Linux/macOS
-.venv/bin/python grabbing.py --login
+```bat
+.venv\Scripts\python grabbing.py --login      :: Windows
+.venv/bin/python grabbing.py --login          # Linux/macOS
 ```
-
-弹出浏览器 → 完成 USTC 统一身份认证登录 → 自动生成 `./auth.json`。
 
 ### 3. 配置 `config.json`
-
-至少设 `target_lesson_id`（要抢的课）、`student_id`、`turn_id`，`mode` 保持 `spam`。
+填 `student_id`、`turn_id`、`target_lesson_id`，以及 **`limit_count`（满课人数 = 容量上限）**。`mode` 保持 `spam`。
+> 「满课人数」怎么填：脚本调 `std-count` 只能拿到「已选人数」，拿不到容量上限；所以需要你手动填。打开选课页看那门课显示的容量（如 `容量 178`），把数字填进 `limit_count`。脚本在「已选人数 < 满课人数」时才抢。
 
 ### 4. 运行
-
-```bash
-# Windows
+```bat
 .venv\Scripts\python grabbing.py
-# Linux/macOS
-.venv/bin/python grabbing.py        # 或 ./run.sh
+.venv/bin/python grabbing.py
 ```
-
-看到 `选课: ok=False | 教学班人数已满` 就是正常等退课；某次 `ok=True` 即抢到，自动退出。
-
----
+看到 `std-count 探测：...` 和每轮 `已满 x/y` 就是正常；出现 `有空位！` 即触发选课。
 
 ## 在 Linux 服务器上跑（无图形界面）
+1. 本机 `--login` 生成 `auth.json`。
+2. `scp -r ustc_grab_classes/ user@server:/path/...`
+3. 服务器装环境（同上 Linux 命令）。
+4. `.venv/bin/python grabbing.py`（默认 headless）。
 
-服务器没有浏览器界面，无法在那里登录。流程：
-
-1. 按「快速开始」在**本机**（Windows/Mac）`--login` 生成 `auth.json`。
-2. 把项目（含 `auth.json`）传到服务器：
-   ```bash
-   scp -r ustc_grab_classes/ user@server:/path/to/ustc_grab_classes
-   ```
-3. 服务器装环境（同上 Linux 命令；若报缺系统库见下文 FAQ）。
-4. 服务器运行（默认 headless）：
-   ```bash
-   cd /path/to/ustc_grab_classes
-   .venv/bin/python grabbing.py        # 或 ./run.sh
-   ```
-
-**服务器是否依赖本机？** 不依赖。`auth.json` 拷过去后服务器完全独立运行——本机关机、关浏览器、删本地文件都不影响服务器。脚本持续运行时服务器会续期 cookie，长期挂着一般不过期；万一失效，脚本会提示，回本机重 `--login` 刷新 `auth.json` 再传一次即可。
-
----
+服务器完全独立运行；本机关机/删本地文件不影响。`auth.json` 拷过去即可。
 
 ## `config.json` 字段
 
 | 字段 | 说明 |
 |---|---|
 | `student_id` | 学生关联 id；留空自动解析（从选课页 URL 取）|
-| `turn_id` | 选课轮次 id，**每学期变**；从选课页 URL `.../turn/{id}/select` 取 |
+| `turn_id` | 选课轮次 id，**每学期变** |
 | `target_lesson_id` | 目标课 lessonId（如 `123456`）|
 | `target_course_name` | 课程名模糊匹配（兜底）|
-| `interval_seconds` | 尝试间隔（秒），最小 5，建议 ≥ 30 |
-| `mode` | `spam` 盲抢（推荐，默认）；`monitor`/`grab` 依赖已选人数（基本无效）|
+| `limit_count` | **必填**：目标课「满课人数」(容量上限)。脚本在「已选人数 < 满课人数」时才抢（`std-count` 只返回人数，容量需手填）|
+| `interval_seconds` | 查询基准间隔（秒），建议 ≥ 60 |
+| `jitter_seconds` | 随机抖动（秒），实际间隔 = interval ± jitter |
+| `active_hours` | 活跃时段 `HH:MM-HH:MM`，支持跨天；默认 `6:30-1:00`（即 1:00–6:30 暂停）。空 = 全天 |
+| `max_errors` | 连续异常熔断阈值，达到即停止 |
+| `mode` | `spam` 监控到空位就抢（默认）；`monitor` 仅提醒；`grab` 同 spam |
 | `notify_webhook_url` | 可选，事件时 GET 该 URL |
-| `headless` | **一般不用设**：默认按平台自动判断。需强制时填 `true`/`false` |
+| `headless` | 一般不用设，默认按平台自动判断 |
 
 ## 命令一览
-
 ```bash
 grabbing.py --login            # 登录并生成 auth.json（需图形界面）
-grabbing.py --list             # 列出可选课（查/确认 lessonId）
-grabbing.py                    # 盲抢（按 config.json）
-grabbing.py --lesson 123456 -m spam -t 30 --log run.log
+grabbing.py --list             # 列出可选课（查 lessonId / 容量）
+grabbing.py                    # 监控抢课（按 config.json）
+grabbing.py --lesson 123456 -t 90 --log run.log
 grabbing.py --headless         # 强制无头
 ```
 
 ## 文件说明
-
 | 文件 | 作用 |
 |---|---|
-| `grabbing.py` | 主程序（盲抢 + 登录失效检测 + 跨平台 headless）|
+| `grabbing.py` | 主程序（监控式抢课 + 登录失效检测 + 跨平台 headless）|
 | `jw_login.py` | 登录模块（Playwright + auth.json）|
 | `config.json` | 运行配置 |
 | `auth.json` | 登录态（cookie），**敏感，勿提交**，已 gitignore |
 | `requirements.txt` | 依赖 |
-| `run.sh` | Linux/macOS 启动便捷脚本（Windows 不用）|
-| `grabbing_legacy.py` / `monitoring*.py` | 旧版失效脚本，存档 |
+| `run.sh` | Linux/macOS 启动便捷脚本 |
 
 ## 常见问题
-
-- **Windows 上 `grabbing.py` 弹出浏览器窗口**：正常，默认非 headless。不想看窗口可 `--headless`。
-- **Linux 服务器报缺系统库（`libnss3` 等）**：`playwright install` 不装系统库。免 sudo 方案：用 conda（用户级）装这些库；或让管理员 `apt install` 一次。
-- **`登录失败：未登录且处于 headless`**：服务器上没有有效 `auth.json`。先在本机 `--login` 生成 `auth.json`，拷到服务器。
-- **一直「教学班人数已满」**：正常，满员等退课。
-- **非选课时段**：提示解析不到 turnId；选课开放后再跑，或 `config.json` 显式填 `turn_id`。
+- **`std-count 探测` 显示 `解析人数=None`**：响应结构与脚本假设不符。把探测输出的「原始片段」贴出来，对照调整 `_parse_std_count`。
+- **一直「已满 x/y」**：正常，等退课。
+- **`登录态已过期`**：回本机 `--login` 刷新 `auth.json` 再传一次。
+- **被风控/账号受限**：立即停止，降频或改手动；联系教务说明。
+- **非选课时段**：解析不到 turnId；选课开放后再跑，或填 `turn_id`。
