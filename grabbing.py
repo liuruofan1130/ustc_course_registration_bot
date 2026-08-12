@@ -91,7 +91,8 @@ def load_config():
         "limit_count": 0,          # 必填：目标课「满课人数」(容量上限)
         "interval_seconds": 60,    # 查询基准间隔（秒），实际 = interval ± jitter
         "jitter_seconds": 15,      # 随机抖动（秒）；60±15 = 45~75
-        "active_hours": "6:30-1:00",  # 活跃时段 HH:MM-HH:MM；1:00-6:30 暂停；空=全天
+        "heart_beat": 300,         # 非活跃时段心跳间隔（秒），实际 = heart_beat ± jitter；用于保活
+        "active_hours": "6:30-1:00",  # 活跃时段 HH:MM-HH:MM；非活跃时段仅发心跳保活；空=全天
         "max_errors": 20,          # 连续异常熔断阈值
         "mode": "spam",            # spam 监控到空位就抢(推荐) | monitor 仅提醒 | grab 同 spam
         "notify_webhook_url": "",  # 可选：事件时 GET 该 url
@@ -359,21 +360,6 @@ def _in_active_hours(spec):
         return now >= start or now < end
 
 
-def _minutes_to_active(spec):
-    """到下一个活跃起点的大致分钟数（用于暂停期间休眠）。"""
-    try:
-        a, _ = spec.split("-", 1)
-        start = _parse_hhmm(a)
-        if start is None:
-            return 60
-    except Exception:
-        return 60
-    now = _now_minutes()
-    if now < start:
-        return max(1, start - now)
-    return max(1, 24 * 60 - now + start)
-
-
 # ----------------------------- 通知 -----------------------------
 def notify(cfg, message):
     print("[通知]", message)
@@ -493,6 +479,7 @@ def main():
 
         interval = max(10, int(cfg.get("interval_seconds", 60)))
         jitter = max(0, int(cfg.get("jitter_seconds", interval // 3)))
+        heart_beat = max(30, int(cfg.get("heart_beat", 300)))
         active = (cfg.get("active_hours") or "").strip()
         max_errors = max(3, int(cfg.get("max_errors", 20)))
 
@@ -505,12 +492,7 @@ def main():
         while True:
             n += 1
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
-            # 活跃时段：非活跃则睡到下一档
-            if not _in_active_hours(active):
-                mins = _minutes_to_active(active)
-                print(f"[{ts}] #{n} 非活跃时段({active})，休眠约 {mins} 分钟")
-                time.sleep(min(max(mins * 60, 60), 3600))
-                continue
+            in_active = _in_active_hours(active)
             try:
                 r = std_count_raw(context, lid, sid, tid)
                 body = r.text()
@@ -533,7 +515,8 @@ def main():
                             return
                 else:
                     consecutive_err = 0
-                    print(f"[{ts}] #{n} 已满 {count}/{limit}")
+                    tag = "" if in_active else "（心跳保活）"
+                    print(f"[{ts}] #{n} 已满 {count}/{limit}{tag}")
             except LoginExpired as e:
                 print(f"[{ts}] #{n} ⚠️ {e}")
                 print("    请在有图形界面的机器 `python grabbing.py --login` 重新生成 auth.json，")
@@ -547,7 +530,9 @@ def main():
                     print(f"连续 {consecutive_err} 次异常，触发熔断，停止。请检查网络/登录态。")
                     notify(cfg, f"{cname} 监控熔断停止（连续异常）")
                     return
-            sleep_s = interval + random.randint(-jitter, jitter)
+            # 活跃→正常间隔；非活跃→心跳间隔（均为 ± jitter）
+            base = interval if in_active else heart_beat
+            sleep_s = base + random.randint(-jitter, jitter)
             time.sleep(max(5, sleep_s))
     finally:
         # 三处资源清理彼此独立，任一失败不影响其余
